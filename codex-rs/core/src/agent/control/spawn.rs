@@ -317,7 +317,8 @@ impl LocalAgentControl {
         )))
     }
 
-    /// A provided parent enables owner-validated reloads; `None` preserves sender-driven reloads.
+    /// A provided or resident recorded parent owns reload settings. Sender settings
+    /// remain a fallback when no parent runtime is available.
     /// Keep the returned residency pin until the caller has submitted its input.
     pub(crate) async fn ensure_v2_agent_loaded(
         &self,
@@ -388,6 +389,17 @@ impl LocalAgentControl {
         let (session_source, _) = initial_history
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
+        // Messaging tools supply the sender's config, but a sibling can have
+        // different runtime permissions. Reuse the owner-validated reload path
+        // whenever the recorded parent is resident. Do not load absent parents:
+        // surviving children must still be able to recover an unloaded tree.
+        if parent.is_none()
+            && let Some(recorded_parent_id) = session_source.parent_thread_id()
+            && let Ok(recorded_parent) = state.get_thread(recorded_parent_id).await
+        {
+            return Box::pin(self.ensure_v2_agent_loaded(config, thread_id, Some(recorded_parent)))
+                .await;
+        }
         if let Some(parent_thread_id) = owner_thread_id {
             if session_source.parent_thread_id() != Some(parent_thread_id)
                 || initial_history

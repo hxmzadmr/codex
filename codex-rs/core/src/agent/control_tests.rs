@@ -1091,6 +1091,121 @@ async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
 }
 
 #[tokio::test]
+async fn v2_followup_reload_preserves_full_access_with_restricted_sender() {
+    check_v2_followup_reload_uses_parent_permissions(/*parent_full_access*/ true).await;
+}
+
+#[tokio::test]
+async fn v2_followup_reload_preserves_restrictions_with_full_access_sender() {
+    check_v2_followup_reload_uses_parent_permissions(/*parent_full_access*/ false).await;
+}
+
+async fn check_v2_followup_reload_uses_parent_permissions(parent_full_access: bool) {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    config.multi_agent_v2.max_concurrent_threads_per_session = 4;
+    let (parent_approval, parent_profile, sender_approval, sender_profile) = if parent_full_access {
+        (
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+            AskForApproval::OnRequest,
+            PermissionProfile::read_only(),
+        )
+    } else {
+        (
+            AskForApproval::OnRequest,
+            PermissionProfile::read_only(),
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+    };
+    config
+        .permissions
+        .approval_policy
+        .set(parent_approval)
+        .unwrap();
+    config
+        .permissions
+        .set_permission_profile(parent_profile.clone())
+        .unwrap();
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, parent) = harness.start_paginated_thread().await;
+    let control = parent
+        .session
+        .services
+        .local_agent_runtime
+        .control(parent.session.session_id());
+    let child =
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &parent, "worker").await;
+    let mut sender_config = harness.config.clone();
+    sender_config
+        .permissions
+        .approval_policy
+        .set(sender_approval)
+        .unwrap();
+    sender_config
+        .permissions
+        .set_permission_profile(sender_profile)
+        .unwrap();
+    let sender = spawn_v2_reload_test_child(&control, sender_config, &parent, "sender").await;
+    let sender_thread = harness.manager.get_thread(sender.thread_id).await.unwrap();
+    let sender_turn = sender_thread.session.new_default_turn().await;
+    // Match the followup_task handler: the resume hint belongs to the sender,
+    // which is not necessarily the recipient's parent or its permission authority.
+    let resume_config =
+        crate::agent::child_config::build_agent_resume_config(&sender_turn).unwrap();
+    let child_thread = harness.manager.get_thread(child.thread_id).await.unwrap();
+    child_thread
+        .inject_response_items(vec![assistant_message(
+            "child persisted",
+            Some(MessagePhase::FinalAnswer),
+        )])
+        .await
+        .unwrap();
+
+    for unloaded in [false, true] {
+        if unloaded {
+            // Stop and unload the exact runtime deterministically; eviction
+            // admission is covered separately by the residency tests.
+            child_thread
+                .shutdown_and_wait()
+                .await
+                .expect("stop the child runtime");
+            assert!(
+                harness
+                    .manager
+                    .remove_thread(&child.thread_id)
+                    .await
+                    .is_some(),
+            );
+            assert_thread_not_loaded(&harness.manager, child.thread_id).await;
+        }
+        let receipt = control
+            .send(SendRequest {
+                caller: sender.thread_id,
+                target: AgentTarget::Id(child.thread_id),
+                resume_config: resume_config.clone(),
+                input: AgentInput::Message {
+                    message: AgentMessage::Plaintext("continue the task".to_string()),
+                    mode: MessageDeliveryMode::TriggerTurn,
+                },
+                start_options: Default::default(),
+            })
+            .await
+            .expect("follow-up should reach the same child");
+        assert_eq!(receipt.thread_id, child.thread_id);
+        let child_thread = harness.manager.get_thread(child.thread_id).await.unwrap();
+        let turn = child_thread.session.new_default_turn().await;
+        assert_eq!(
+            (turn.approval_policy(), turn.permission_profile()),
+            (parent_approval, parent_profile.clone()),
+            "a sender must not replace the recipient's parent permissions (unloaded={unloaded})",
+        );
+    }
+}
+
+#[tokio::test]
 async fn cancelled_v2_send_finishes_reload_registration() {
     let (home, mut config) = test_config().await;
     config.features.enable(Feature::MultiAgentV2).unwrap();
